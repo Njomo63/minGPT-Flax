@@ -11,7 +11,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 
-
+from jax import lax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -39,6 +39,7 @@ class CausalSelfAttention(nn.Module):
     explicit implementation here to show that there is nothing too scary here.
     """
     config: Any
+    decode: bool = False
 
 
     def setup(self):
@@ -65,7 +66,6 @@ class CausalSelfAttention(nn.Module):
         v = v.reshape(B, T, self.n_head, C // self.n_head).swapaxes(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        q = q / jnp.sqrt(q.shape[-1])
         att = (q @ k.swapaxes(-2, -1)) * (1.0 / jnp.sqrt(k.shape[-1]))
         att = jnp.where(mask, att, jnp.finfo(dtype).min)  # apply mask
         att = nn.softmax(att, axis=-1)
@@ -76,6 +76,7 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.resid_dropout(self.c_proj(y), deterministic=not training)
         return y
+
 
 class MLP(nn.Module):
     """An unassuming MLP block."""
@@ -208,7 +209,6 @@ class GPT(nn.Module):
 
         return model, freeze(hf_params)
 
-
     def __call__(self, idx, training: bool):
         b, t = idx.shape
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
@@ -229,3 +229,33 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
 
         return logits
+
+    def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.shape[1] <= self.block_size else idx[:, -self.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                dtype = logits.dtype
+                big_neg = jnp.finfo(dtype).min
+                v, _ = lax.top_k(logits, top_k)
+                logits = jnp.where(logits < v[:, [-1]], big_neg, logits)
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = nn.activation.softmax(logits, axis=-1)
+            # either sample from the distribution or take the most likely element
+            if do_sample:
+                rvs = np.random.multinomial(1, probs)
+                idx_next = rvs.argmax(axis=-1, keepdims=True)
+            else:
+                _, idx_next = lax.top_k(probs, k=1)
+            # append sampled index to the running sequence and continue
+            idx = jnp.concatenate((idx, idx_next), axis=1)
