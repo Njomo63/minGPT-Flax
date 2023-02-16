@@ -10,10 +10,12 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 
 import math
+from functools import partial
 
 from jax import lax
 import jax.numpy as jnp
 from flax import linen as nn
+from flax.linen.linear import DenseGeneral
 from flax.traverse_util import flatten_dict, unflatten_dict
 from flax.core import freeze, unfreeze
 import numpy as np
@@ -39,23 +41,46 @@ class CausalSelfAttention(nn.Module):
     explicit implementation here to show that there is nothing too scary here.
     """
     config: Any
-    decode: bool = False
-
+    causal: bool = False    
 
     def setup(self):
-        assert self.config.n_embd % self.config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Dense(3 * self.config.n_embd)
-        # output projection
-        self.c_proj = nn.Dense(self.config.n_embd)
-        # regularization
-        self.attn_dropout = nn.Dropout(rate=self.config.attn_pdrop)
-        self.resid_dropout = nn.Dropout(rate=self.config.resid_pdrop)
-    
+        self.c_attn = nn.Dense(3 * self.config.n_embd, kernel_init=self.config.kernel_init,
+                               bias_init=self.config.bias_init)
+        self.c_proj = nn.Dense(self.config.n_embd, kernel_init=self.config.kernel_init,
+                               bias_init=self.config.bias_init)
+        causal_mask = nn.make_causal_mask(jnp.ones((1, self.config.block_size),dtype="bool"), dtype="bool")
         self.n_head = self.config.n_head
         self.n_embd = self.config.n_embd
 
-    def __call__(self, x: Array, mask: Array, training:bool):
+    @nn.compact
+    def _kv_cache(self, key, value, query, attention_mask):
+        is_initialized = self.has_variable("cache", "cached_key")
+        cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
+        cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
+        cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
+
+        if is_initialized:
+            *batch_dims, num_heads, max_length, depth_per_head = cached_key.value.shape
+            cur_index = cache_index.value
+            indices = (0,) * len(batch_dims) + (0, cur_index, 0)
+            key = lax.dynamic_update_slice(cached_key.value, key, indices)
+            value = lax.dynamic_update_slice(cached_value.value, value, indices)
+            cached_key.value = key
+            cached_value.value = value
+            num_updated_cache_vectors = query.shape[2]
+            cache_index.value = cache_index.value + num_updated_cache_vectors
+            # causal mask for cached decoder self-attention: our single query position should only attend to those key positions that have already been generated and cached, not the remaining zero elements.
+            pad_mask = jnp.broadcast_to(
+                jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
+                tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
+            )
+            attention_mask = jnp.logical_and(pad_mask, attention_mask)
+        return key, value, attention_mask
+
+    def __call__(self, x: Array, init_cache:bool, training:bool):
+        assert self.config.n_embd % self.config.n_head == 0
+
+
         B, T, C = x.shape # batch size, sequence length, embedding dimensionality (n_embd)
         dtype = x.dtype
 
@@ -65,16 +90,40 @@ class CausalSelfAttention(nn.Module):
         q = q.reshape(B, T, self.n_head, C // self.n_head).swapaxes(1, 2) # (B, nh, T, hs)
         v = v.reshape(B, T, self.n_head, C // self.n_head).swapaxes(1, 2) # (B, nh, T, hs)
 
+        query_length, key_length = q.shape[2], k.shape[2]
+        if self.causal:
+            if self.has_variable("cache", "cached_key"):
+                mask_shift = self.variables["cache"]["cache_index"]
+                max_decoder_length = self.variables["cache"]["cached_key"].shape[2]
+                causal_mask = lax.dynamic_slice(
+                    self.causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
+                )
+            else:
+                causal_mask = self.causal_mask[:, :, :query_length, :key_length]
+            causal_mask = jnp.broadcast_to(causal_mask, (B,) + causal_mask.shape[1:])
+
+        if self.causal and (self.has_variable("cache", "cached_key") or init_cache):
+            k, v, mask = self._kv_cache(k, v, q, causal_mask)
+        
+        attention_bias = lax.select(
+            mask > 0,
+            jnp.full(mask.shape, 0.0).astype(dtype),
+            jnp.full(mask.shape, jnp.finfo(dtype).min).astype(dtype,
+        ))
+
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.swapaxes(-2, -1)) * (1.0 / jnp.sqrt(k.shape[-1]))
-        att = jnp.where(mask, att, jnp.finfo(dtype).min)  # apply mask
+
+        att = att + attention_bias  # apply mask
         att = nn.softmax(att, axis=-1)
-        att = self.attn_dropout(att, deterministic=not training)
+        attn_dropout = nn.Dropout(rate=self.config.attn_pdrop)
+        att = attn_dropout(att, deterministic=not training)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.swapaxes(1, 2).reshape(B,T,C) # re-assemble all head outputs side by side
 
         # output projection
-        y = self.resid_dropout(self.c_proj(y), deterministic=not training)
+        resid_dropout = nn.Dropout(rate=self.config.resid_pdrop)
+        y = resid_dropout(self.c_proj(y), deterministic=not training)
         return y
 
 
@@ -112,9 +161,9 @@ class Layers(nn.Module):
     config: Any
 
     @nn.compact
-    def __call__(self, x: Array, mask: Array, training: bool):
+    def __call__(self, x: Array, init_cache: bool, training: bool):
         for i in range(self.config.n_layer):
-            x = Block(self.config, name=str(i))(x, mask, training)
+            x = Block(self.config, name=str(i))(x, init_cache, training)
         return x
 
 
@@ -221,9 +270,8 @@ class GPT(nn.Module):
         x = self.drop(tok_emb + pos_emb, deterministic=not training)
 
         # causal mask to ensure that attention is only applied to the left in the input sequence
-        attn_mask = nn.make_causal_mask(idx, dtype=bool)
 
-        x = self.h(x, attn_mask, training)
+        x = self.h(x, init_cache, training)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
