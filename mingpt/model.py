@@ -34,23 +34,26 @@ class NewGELU(nn.Module):
     def forward(self, x):
         return 0.5 * x * (1.0 + jnp.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * jnp.power(x, 3.0))))
 
+
+
 class CausalSelfAttention(nn.Module):
     """
     A vanilla multi-head masked self-attention layer with a projection at the end.
     It is possible to use torch.nn.MultiheadAttention here but I am including an
     explicit implementation here to show that there is nothing too scary here.
     """
-    config: Any
-    causal: bool = False    
+    config: Any 
 
     def setup(self):
         self.c_attn = nn.Dense(3 * self.config.n_embd, kernel_init=self.config.kernel_init,
-                               bias_init=self.config.bias_init)
+                            bias_init=self.config.bias_init)
         self.c_proj = nn.Dense(self.config.n_embd, kernel_init=self.config.kernel_init,
-                               bias_init=self.config.bias_init)
-        causal_mask = nn.make_causal_mask(jnp.ones((1, self.config.block_size),dtype="bool"), dtype="bool")
+                            bias_init=self.config.bias_init)
+        self.causal_mask = nn.make_causal_mask(jnp.ones((1, self.config.block_size),dtype="bool"), dtype="bool")
         self.n_head = self.config.n_head
         self.n_embd = self.config.n_embd
+        self.attn_dropout = nn.Dropout(rate=self.config.attn_pdrop)
+        self.resid_dropout = nn.Dropout(rate=self.config.resid_pdrop)
 
     @nn.compact
     def _kv_cache(self, key, value, query, attention_mask):
@@ -91,24 +94,23 @@ class CausalSelfAttention(nn.Module):
         v = v.reshape(B, T, self.n_head, C // self.n_head).swapaxes(1, 2) # (B, nh, T, hs)
 
         query_length, key_length = q.shape[2], k.shape[2]
-        if self.causal:
-            if self.has_variable("cache", "cached_key"):
-                mask_shift = self.variables["cache"]["cache_index"]
-                max_decoder_length = self.variables["cache"]["cached_key"].shape[2]
-                causal_mask = lax.dynamic_slice(
-                    self.causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
-                )
-            else:
-                causal_mask = self.causal_mask[:, :, :query_length, :key_length]
-            causal_mask = jnp.broadcast_to(causal_mask, (B,) + causal_mask.shape[1:])
-
-        if self.causal and (self.has_variable("cache", "cached_key") or init_cache):
-            k, v, mask = self._kv_cache(k, v, q, causal_mask)
+        if self.has_variable("cache", "cached_key"):
+            mask_shift = self.variables["cache"]["cache_index"]
+            max_decoder_length = self.variables["cache"]["cached_key"].shape[2]
+            causal_mask = lax.dynamic_slice(
+                self.causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
+            )
+        else:
+            causal_mask = self.causal_mask[:, :, :query_length, :key_length]
+        causal_mask = jnp.broadcast_to(causal_mask, (B,) + causal_mask.shape[1:])
+    
+        if self.has_variable("cache", "cached_key") or init_cache:
+            k, v, causal_mask = self._kv_cache(k, v, q, causal_mask)
         
         attention_bias = lax.select(
-            mask > 0,
-            jnp.full(mask.shape, 0.0).astype(dtype),
-            jnp.full(mask.shape, jnp.finfo(dtype).min).astype(dtype,
+            causal_mask > 0,
+            jnp.full(causal_mask.shape, 0.0).astype(dtype),
+            jnp.full(causal_mask.shape, jnp.finfo(dtype).min).astype(dtype,
         ))
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
@@ -116,14 +118,13 @@ class CausalSelfAttention(nn.Module):
 
         att = att + attention_bias  # apply mask
         att = nn.softmax(att, axis=-1)
-        attn_dropout = nn.Dropout(rate=self.config.attn_pdrop)
-        att = attn_dropout(att, deterministic=not training)
+        
+        att = self.attn_dropout(att, deterministic=not training)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.swapaxes(1, 2).reshape(B,T,C) # re-assemble all head outputs side by side
 
         # output projection
-        resid_dropout = nn.Dropout(rate=self.config.resid_pdrop)
-        y = resid_dropout(self.c_proj(y), deterministic=not training)
+        y = self.resid_dropout(self.c_proj(y), deterministic=not training)
         return y
 
 
@@ -134,7 +135,7 @@ class MLP(nn.Module):
     @nn.compact
     def __call__(self, x: Array, training: bool):
         x = nn.Dense(4 * self.config.n_embd, name='c_fc')(x)
-        x = NewGELU(x)
+        x = NewGELU()(x)
         x = nn.Dense(self.config.n_embd, name='c_proj')(x)
         return nn.Dropout(rate=self.config.resid_pdrop)(x, deterministic=not training)
 
@@ -150,8 +151,8 @@ class Block(nn.Module):
         self.mlp = MLP(self.config)
 
 
-    def __call__(self, x, mask: Array, training: bool):
-        x = x + self.attn(self.ln_1(x), mask, training)
+    def __call__(self, x, init_cache: bool, training: bool):
+        x = x + self.attn(self.ln_1(x), init_cache, training)
         x = x + self.mlp(self.ln_2(x), training)
         return x
 
@@ -258,7 +259,7 @@ class GPT(nn.Module):
 
         return model, freeze(hf_params)
 
-    def __call__(self, idx, training: bool):
+    def __call__(self, idx, training: bool = True, init_cache: bool = False):
         b, t = idx.shape
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
         
@@ -278,32 +279,4 @@ class GPT(nn.Module):
 
         return logits
 
-    def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.shape[1] <= self.block_size else idx[:, -self.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                dtype = logits.dtype
-                big_neg = jnp.finfo(dtype).min
-                v, _ = lax.top_k(logits, top_k)
-                logits = jnp.where(logits < v[:, [-1]], big_neg, logits)
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = nn.activation.softmax(logits, axis=-1)
-            # either sample from the distribution or take the most likely element
-            if do_sample:
-                rvs = np.random.multinomial(1, probs)
-                idx_next = rvs.argmax(axis=-1, keepdims=True)
-            else:
-                _, idx_next = lax.top_k(probs, k=1)
-            # append sampled index to the running sequence and continue
-            idx = jnp.concatenate((idx, idx_next), axis=1)
+    

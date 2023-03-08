@@ -13,7 +13,7 @@ import json
 import regex as re
 import requests
 
-import torch
+import jax.numpy as jnp
 
 # -----------------------------------------------------------------------------
 
@@ -255,20 +255,20 @@ def get_encoder():
 # -----------------------------------------------------------------------------
 
 class BPETokenizer:
-    """ PyTorch-aware class that wraps the Encoder above """
+    """ Jax-aware class that wraps the Encoder above """
 
     def __init__(self):
         self.encoder = get_encoder()
 
     def __call__(self, text, return_tensors='pt'):
-        # PyTorch only; here because we want to match huggingface/transformers interface
+        # Jax only; here because we want to match huggingface/transformers interface
         assert return_tensors == 'pt'
         # single string input for now, in the future potentially a list of strings
         assert isinstance(text, str)
         # encode and create a "batch dimension" of 1
         idx = [self.encoder.encode(text)]
-        # wrap into PyTorch tensor
-        out = torch.tensor(idx, dtype=torch.long)
+        # wrap into Jax array
+        out = jnp.array(idx, dtype=jnp.int64)
         return out
 
     def decode(self, idx):
@@ -277,7 +277,10 @@ class BPETokenizer:
         # decode indices to text
         text = self.encoder.decode(idx.tolist())
         return text
-
+text = "He went to school. and then he came back home."
+tokenizer = BPETokenizer()
+out = tokenizer(text)
+print(out.shape)
 
 if __name__ == '__main__':
 
